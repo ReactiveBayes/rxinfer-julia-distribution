@@ -1,0 +1,26 @@
+# Bundled into the distribution and FROZEN INTO THE SYSTEM IMAGE.
+#
+# RxInfer reads these through `@load_preference`, which is evaluated when the
+# package is compiled -- and RxInfer is compiled into the system image here. So
+# these values are baked in: a student running this distribution cannot change
+# them, and `RxInfer.disable_rxinfer_using_telemetry!()` has no effect because it
+# writes a preference that can no longer be read.
+#
+# They are therefore stated explicitly rather than inherited by accident. These
+# are RxInfer's own defaults -- the same behaviour as `Pkg.add("RxInfer")`:
+#
+#   enable_using_rxinfer_telemetry = true   one anonymous event per `using RxInfer`
+#                                           (timestamp, per-session random UUID,
+#                                           RxInfer version, Julia version)
+#   enable_session_logging         = true   local only; nothing leaves the machine
+#   automatic_session_sharing      = false  opt-in, and left off
+#
+# The runtime opt-out that DOES work in the distribution is the environment
+# variable `LOG_USING_RXINFER=false`, which the README documents prominently
+# because it is the only one.
+
+[RxInfer]
+enable_using_rxinfer_telemetry = true
+enable_session_logging = true
+automatic_session_sharing = false
+share_source_code = false

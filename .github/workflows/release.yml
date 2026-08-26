@@ -1,0 +1,351 @@
+---
+name: "Distribution"
+
+# Builds the RxInfer Julia distribution for every supported platform, smoke-tests
+# the built tree, and publishes the tarballs as a GitHub release.
+#
+# Two tracks over one workflow (see AGENTS.md, "Release cadence"):
+#
+#   stable  -- a `v*` tag or a manual dispatch. Marked latest. What the installer
+#              scripts install by default, and therefore what students get.
+#   weekly  -- the Sunday schedule. Published as a `weekly-YYYY-MM-DD`
+#              PRERELEASE that is never marked latest, so a Sunday build can
+#              never become what `julia +rxinfer` resolves to mid-course.
+#
+# The weekly track also re-resolves rather than building the committed manifest:
+# the point of a weekly build is to find out early that a new RxInfer, a new
+# dependency or a new Julia broke the build -- without exposing students to it.
+
+on:
+  push:
+    tags:
+      - "v*"
+  schedule:
+    # Sundays, 03:00 UTC. GitHub queues scheduled runs at low priority and they
+    # can be delayed well past this; that is fine for a weekly refresh. Note also
+    # that GitHub disables schedules in a repository with no activity for 60
+    # days, so a repo whose only traffic is its own scheduled runs will need the
+    # schedule re-enabled periodically.
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      re-resolve:
+        description: "Re-resolve dependencies instead of building the committed manifest"
+        type: "boolean"
+        default: false
+
+permissions:
+  contents: "read"
+
+concurrency:
+  # A manual run and a scheduled one must not race for the same release.
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: false
+
+env:
+  JULIA_VERSION: "1.12.6"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Decides what this run is: which track, which tag, and -- for a weekly run --
+  # whether anything actually moved since the last one. Resolving here rather
+  # than in each build job is what lets a quiet Sunday cost a minute instead of
+  # three hours of runner time across three platforms.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: "Plan the release"
+    runs-on: "ubuntu-latest"
+    timeout-minutes: 15
+
+    outputs:
+      track: "${{ steps.plan.outputs.track }}"
+      tag: "${{ steps.plan.outputs.tag }}"
+      version: "${{ steps.plan.outputs.version }}"
+      build: "${{ steps.plan.outputs.build }}"
+
+    steps:
+      - name: "Check out the source"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+
+      - name: "Install Julia"
+        uses: "julia-actions/install-juliaup@1cc1b0ecfb06c04ff09fe24cab1476106460750e" # v3.1.5
+        with:
+          channel: "${{ env.JULIA_VERSION }}"
+
+      - name: "Decide the track, the tag, and whether to build"
+        id: "plan"
+        env:
+          GH_TOKEN: "${{ github.token }}"
+          RE_RESOLVE: "${{ inputs.re-resolve }}"
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TRACK="stable"
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+          else
+            TRACK="weekly"
+            TAG="weekly-$(date -u +%Y-%m-%d)"
+            VERSION="${TAG}"
+          fi
+
+          echo "track=${TRACK}" >>"${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >>"${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >>"${GITHUB_OUTPUT}"
+
+          # A stable release always builds: the tag is the decision.
+          if [ "${TRACK}" = "stable" ]; then
+            echo "build=true" >>"${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # A weekly re-resolves, then compares against the manifest the previous
+          # weekly shipped. Identical resolution means nothing to learn from a
+          # three-hour build.
+          julia --project=. -e 'using Pkg; Pkg.update()'
+          NEW_HASH="$(julia --project=. -e 'using TOML; print(TOML.parsefile("Manifest.toml")["project_hash"])')"
+          echo "Resolved project_hash: ${NEW_HASH}"
+
+          PREVIOUS_HASH=""
+          if gh release download --repo "${GITHUB_REPOSITORY}" \
+               --pattern "project_hash.txt" --dir previous \
+               "$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 50 \
+                    --json tagName,isPrerelease \
+                    --jq '[.[] | select(.isPrerelease and (.tagName | startswith("weekly-")))] | first | .tagName // empty')" \
+               2>/dev/null; then
+            PREVIOUS_HASH="$(cat previous/project_hash.txt)"
+          fi
+
+          if [ "${NEW_HASH}" = "${PREVIOUS_HASH}" ]; then
+            echo "::notice::Resolution unchanged since the last weekly (${NEW_HASH}); skipping the build."
+            echo "build=false" >>"${GITHUB_OUTPUT}"
+          else
+            echo "build=true" >>"${GITHUB_OUTPUT}"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # One build per platform. Nothing is cached: every run resolves and links from
+  # scratch, which is what makes the artefact trustworthy.
+  # ---------------------------------------------------------------------------
+  build:
+    name: "Build (${{ matrix.platform }})"
+    needs: "plan"
+    if: "needs.plan.outputs.build == 'true'"
+
+    runs-on: "${{ matrix.runner }}"
+
+    # A distribution build is long enough that a wedged one is worth failing
+    # rather than leaving to GitHub's six-hour default.
+    timeout-minutes: 120
+
+    strategy:
+      # One platform failing must not cancel the others -- the failure is usually
+      # platform-specific, and a weekly still publishes what did build. A stable
+      # release requires all three (see the publish job).
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "linux-x86_64"
+            runner: "ubuntu-latest"
+          - platform: "macos-aarch64"
+            runner: "macos-latest"
+          - platform: "windows-x86_64"
+            runner: "windows-latest"
+
+    env:
+      DISTRIBUTION_ID: "rxinfer-${{ needs.plan.outputs.version }}-${{ matrix.platform }}"
+      # GR opens a display without this and the plotting part of the workload fails.
+      GKSwstype: "100"
+      # The build must not emit telemetry of its own. CI=true already suppresses
+      # it on a hosted runner; this makes it true of a local build too.
+      LOG_USING_RXINFER: "false"
+
+    steps:
+      - name: "Check out the source"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+
+      # The build action deliberately does not install Julia, so this step is
+      # what chooses the runtime the distribution ships. Keep it in step with the
+      # `julia` compat entry in Project.toml.
+      - name: "Install Julia"
+        uses: "julia-actions/install-juliaup@1cc1b0ecfb06c04ff09fe24cab1476106460750e" # v3.1.5
+        with:
+          channel: "${{ env.JULIA_VERSION }}"
+
+      # A weekly builds what it resolved rather than the committed manifest.
+      - name: "Re-resolve for the weekly track"
+        if: "needs.plan.outputs.track == 'weekly'"
+        run: "julia --project=. -e 'using Pkg; Pkg.update()'"
+
+      - name: "Build the distribution"
+        id: "build-distribution"
+        uses: "JuliaComputing/create-julia-distribution@958799562b82fcabd2f5508f7ee296e1d91de200"
+        with:
+          distribution-id: "${{ env.DISTRIBUTION_ID }}"
+          sysimage-script: "sysimage/banner.jl"
+
+      # `--version` is answered before the system image loads, so it exits 0 even
+      # on a tree whose sysimage is missing entirely. Executing real code is the
+      # only thing that demonstrates the distribution works -- and a file a
+      # dependency reads at run time but the copy globs did not ship shows up
+      # here or on a student's laptop, nowhere in between.
+      - name: "Smoke-test the built distribution"
+        env:
+          DISTRIBUTION_PATH: "${{ steps.build-distribution.outputs.distribution-path }}"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          "${DISTRIBUTION_PATH}/bin/julia" --startup-file=no --version
+          "${DISTRIBUTION_PATH}/bin/julia" --startup-file=no "${GITHUB_WORKSPACE}/scripts/smoke_test.jl"
+
+      # Ad-hoc signing: no `rcodesign-config-file`, so no Apple Developer
+      # account, no secret and nothing to renew. On Apple Silicon the kernel
+      # refuses to run a Mach-O whose signature is missing or invalid, and this
+      # build creates `sys.dylib` from scratch. This must be the LAST thing that
+      # touches the tree, so it comes after the smoke test.
+      - name: "Sign the distribution (ad-hoc)"
+        if: "matrix.platform == 'macos-aarch64'"
+        uses: "JuliaComputing/create-julia-distribution/sign-macos@958799562b82fcabd2f5508f7ee296e1d91de200"
+        with:
+          distribution-path: "${{ steps.build-distribution.outputs.distribution-path }}"
+
+      # A broken re-sign only shows up when the binary is executed, so execute it.
+      - name: "Re-run the smoke test after signing"
+        if: "matrix.platform == 'macos-aarch64'"
+        env:
+          DISTRIBUTION_PATH: "${{ steps.build-distribution.outputs.distribution-path }}"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          codesign --verify --verbose "${DISTRIBUTION_PATH}/bin/julia"
+          "${DISTRIBUTION_PATH}/bin/julia" --startup-file=no "${GITHUB_WORKSPACE}/scripts/smoke_test.jl"
+
+      - name: "Pack the distribution"
+        id: "pack-distribution"
+        uses: "JuliaComputing/create-julia-distribution/pack@958799562b82fcabd2f5508f7ee296e1d91de200"
+        with:
+          distribution-path: "${{ steps.build-distribution.outputs.distribution-path }}"
+
+      # The installer verifies this before extracting anything, so it is part of
+      # the release rather than a nicety.
+      - name: "Checksum the tarball"
+        id: "checksum"
+        env:
+          TARBALL_PATH: "${{ steps.pack-distribution.outputs.distribution-tarball-path }}"
+          TARBALL_FILENAME: "${{ steps.pack-distribution.outputs.distribution-tarball-filename }}"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          cd "$(dirname "${TARBALL_PATH}")"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${TARBALL_FILENAME}" >"${TARBALL_FILENAME}.sha256"
+          else
+            shasum -a 256 "${TARBALL_FILENAME}" >"${TARBALL_FILENAME}.sha256"
+          fi
+          cat "${TARBALL_FILENAME}.sha256"
+          echo "sha256-path=${TARBALL_PATH}.sha256" >>"${GITHUB_OUTPUT}"
+
+      # The manifest that was actually built, so a release is reproducible and so
+      # the next weekly can tell whether anything moved.
+      - name: "Record the built manifest"
+        if: "matrix.platform == 'linux-x86_64'"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          cp Manifest.toml "manifest-${{ needs.plan.outputs.version }}.toml"
+          julia --project=. -e 'using TOML; print(TOML.parsefile("Manifest.toml")["project_hash"])' >project_hash.txt
+
+      - name: "Upload the build outputs"
+        uses: "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" # v7.0.1
+        with:
+          name: "distribution-${{ matrix.platform }}"
+          path: |
+            ${{ steps.pack-distribution.outputs.distribution-tarball-path }}
+            ${{ steps.checksum.outputs.sha256-path }}
+            manifest-${{ needs.plan.outputs.version }}.toml
+            project_hash.txt
+          if-no-files-found: "error"
+
+  # ---------------------------------------------------------------------------
+  # Publish. Separate from the build so that a platform failing does not leave a
+  # half-published release, and so the release is created once rather than raced
+  # for by three jobs.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: "Publish the release"
+    needs: ["plan", "build"]
+    # A stable release is all-or-nothing: a `v1.2.3` missing a platform is worse
+    # than no release, because students on that platform get a broken install
+    # command rather than a clear "not released yet". A weekly is diagnostic, so
+    # it publishes whatever built.
+    if: |
+      always() && needs.plan.outputs.build == 'true' && (
+        needs.build.result == 'success' ||
+        (needs.plan.outputs.track == 'weekly' && needs.build.result != 'skipped')
+      )
+
+    runs-on: "ubuntu-latest"
+    timeout-minutes: 30
+
+    permissions:
+      contents: "write"
+
+    steps:
+      - name: "Download the build outputs"
+        uses: "actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b" # v6.0.0
+        with:
+          path: "artifacts"
+          merge-multiple: true
+
+      - name: "Publish"
+        env:
+          GH_TOKEN: "${{ github.token }}"
+          TAG: "${{ needs.plan.outputs.tag }}"
+          TRACK: "${{ needs.plan.outputs.track }}"
+        run: |
+          set -euo pipefail
+
+          if [ "${TRACK}" = "weekly" ]; then
+            EXTRA_FLAGS=(--prerelease --latest=false --title "Weekly build ${TAG}" --notes "Automated weekly build. Not intended for students -- install a stable release instead, or pass \`--weekly\` to the installer.")
+          else
+            EXTRA_FLAGS=(--latest --title "${TAG}" --generate-notes)
+          fi
+
+          # Collect what actually exists rather than passing globs: a weekly
+          # publishes a partial set, and an unmatched glob would reach `gh` as a
+          # literal path and fail the release.
+          ASSETS=()
+          while IFS= read -r -d '' asset; do
+            ASSETS+=("${asset}")
+          done < <(find artifacts -type f \
+                     \( -name '*.tar.gz' -o -name '*.sha256' -o -name '*.toml' -o -name 'project_hash.txt' \) \
+                     -print0)
+
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "::error::No build outputs to publish."
+            exit 1
+          fi
+
+          printf 'Publishing %s asset(s):\n' "${#ASSETS[@]}"
+          printf '  %s\n' "${ASSETS[@]}"
+
+          gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" "${EXTRA_FLAGS[@]}" "${ASSETS[@]}"
+
+      # Unpruned, the schedule accumulates ~300 MB x 3 platforms x 52 weeks of
+      # release assets for nothing.
+      - name: "Prune old weekly prereleases"
+        if: "needs.plan.outputs.track == 'weekly'"
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: |
+          set -euo pipefail
+          gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 \
+            --json tagName,isPrerelease,createdAt \
+            --jq '[.[] | select(.isPrerelease and (.tagName | startswith("weekly-")))]
+                  | sort_by(.createdAt) | reverse | .[4:] | .[].tagName' \
+          | while read -r old_tag; do
+              [ -n "${old_tag}" ] || continue
+              echo "Deleting superseded weekly ${old_tag}"
+              gh release delete "${old_tag}" --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag
+            done

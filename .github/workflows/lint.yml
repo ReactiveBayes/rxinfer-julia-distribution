@@ -1,0 +1,92 @@
+---
+name: "Lint"
+
+# The installer scripts are the student-facing contract and cannot be exercised
+# by the distribution build, so they get their own checks. They are cheap; the
+# distribution build is not.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "main"
+
+permissions:
+  contents: "read"
+
+jobs:
+  shell:
+    name: "Shell"
+    runs-on: "ubuntu-latest"
+    timeout-minutes: 10
+
+    steps:
+      - name: "Check out the source"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+
+      - name: "Check install.sh"
+        run: |
+          set -euo pipefail
+          bash -n install.sh
+          shellcheck install.sh
+
+  powershell:
+    name: "PowerShell"
+    # Must run on Windows: this is the only place install.ps1 is parsed at all
+    # before a student runs it.
+    runs-on: "windows-latest"
+    timeout-minutes: 10
+
+    steps:
+      - name: "Check out the source"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+
+      - name: "Parse install.ps1"
+        shell: "pwsh"
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ./install.ps1), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) {
+            $errors | ForEach-Object { Write-Host "::error::$($_.Message)" }
+            exit 1
+          }
+          Write-Host "install.ps1 parses cleanly"
+
+  julia:
+    name: "Julia"
+    runs-on: "ubuntu-latest"
+    timeout-minutes: 20
+
+    steps:
+      - name: "Check out the source"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+
+      - name: "Install Julia"
+        uses: "julia-actions/install-juliaup@1cc1b0ecfb06c04ff09fe24cab1476106460750e" # v3.1.5
+        with:
+          channel: "1.12.6"
+
+      # Parse-only: running the workload here would cost most of what a real
+      # build costs. A syntax error in it, though, wastes an entire build.
+      - name: "Parse the workload and the smoke test"
+        run: |
+          julia -e 'for f in ("precompile.jl", "scripts/smoke_test.jl", "sysimage/banner.jl")
+                        Meta.parseall(read(f, String))
+                        println(f, " parses")
+                    end'
+
+      # The committed manifest is what makes two builds of the same commit
+      # produce the same distribution, so a manifest that no longer matches the
+      # project must fail here rather than be silently re-resolved by the build.
+      - name: "Check the manifest is in step with the project"
+        run: |
+          set -euo pipefail
+          cp Manifest.toml Manifest.toml.committed
+          julia --project=. -e 'using Pkg; Pkg.resolve()'
+          if ! diff -q Manifest.toml.committed Manifest.toml; then
+            echo "::error::Manifest.toml is out of step with Project.toml. Run 'julia --project=. -e \"using Pkg; Pkg.resolve()\"' and commit the result."
+            diff Manifest.toml.committed Manifest.toml || true
+            exit 1
+          fi
+          echo "Manifest.toml is in step with Project.toml"
