@@ -83,7 +83,17 @@ jobs:
         run: |
           set -euo pipefail
           cp Manifest.toml Manifest.toml.committed
-          julia --project=. -e 'using Pkg; Pkg.resolve()'
+          # `Pkg.resolve()` does not install a registry, and a fresh runner depot
+          # has none -- without this the resolve fails with "expected package ...
+          # to be registered" rather than telling us anything about the manifest.
+          julia --project=. -e '
+            using Pkg
+            try
+                Pkg.Registry.add("General")
+            catch err
+                @info "General registry not added (already present?)" err
+            end
+            Pkg.resolve()'
           if ! diff -q Manifest.toml.committed Manifest.toml; then
             echo "::error::Manifest.toml is out of step with Project.toml. Run 'julia --project=. -e \"using Pkg; Pkg.resolve()\"' and commit the result."
             diff Manifest.toml.committed Manifest.toml || true
