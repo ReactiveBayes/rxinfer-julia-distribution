@@ -34,9 +34,9 @@ pin into someone else's moving target (see **Pinned dependency state**).
 | `precompile.jl` | A compile-time budget, not a test suite. Whatever it exercises is compiled into the shipped image; whatever it costs is added to every platform build. |
 | `sysimage/banner.jl` | Runs *during* image generation. For things that must be baked in rather than applied to the tree afterwards. |
 | `scripts/smoke_test.jl` | Run **by** the built distribution, never by `Pkg.test`. It is the only check that catches a run-time file the copy globs failed to ship — that class of failure is invisible at build time. |
-| `.github/workflows/lint.yml` | The cheap checks: `shellcheck`, the only place `install.ps1` is ever parsed before a student runs it, and a guard that `Manifest.toml` is in step with `Project.toml`. |
+| `.github/workflows/lint.yml` | The cheap checks: `shellcheck`, the only place `install.ps1` is ever parsed before a student runs it, and a guard that `Manifest.toml` is in step with `Project.toml`. Runs on every push, unlike the release build. |
 | `install.sh`, `install.ps1` | The student-facing contract. Must stay **idempotent**: re-running is how a student upgrades. |
-| `.github/workflows/release.yml` | Both tracks (stable + weekly). See *Release cadence*. |
+| `.github/workflows/release.yml` | Tag-triggered only. See *Release cadence* — this file spends real money, so read it before changing it. |
 
 ## Pinned dependency state
 
@@ -49,7 +49,7 @@ unversioned upstream work, and the failure modes differ by pin.
 | `PackageCompiler` at rev `9f277c199e7a21ca82d5e54cda39644c3835cbfe` | **Inside the action** (`bin/setup-package-compiler.jl`) — *not ours to set* | `create_distribution` does not exist in any released PackageCompiler; it lives on an unmerged branch. The action installs this exact commit into a shared `create-julia-distribution-support` environment reached through `LOAD_PATH`. There is **no input to override it**, and nothing in our `Project.toml`/`Manifest.toml` affects which compiler builds the distribution. Consequence: bumping the action SHA is *also* a PackageCompiler bump, and that is where a silent change in what gets bundled would come from. |
 | `rcodesign_jll` 0.29.0+1, sha256-pinned | Inside the action (`sign-macos/get_rcodesign.sh`) | Used for macOS signing. Only the `aarch64-apple-darwin` build is pinned, which is *why* the signing step needs an Apple Silicon runner. Fails closed on a checksum mismatch; overridable via the `RCODESIGN` env var. |
 | Julia `1.12.6` | `install-juliaup` step **and** `[compat] julia = "=1.12.6"` | This is the runtime that ships — the action deliberately does not install Julia, so that step is what chooses it. The two must move together; the compat entry is what turns a mismatch into a resolve-time failure instead of a distribution built against the wrong Julia. `compress-sysimage` stays `false` until we move to Julia 1.13+, which is where it is supported. |
-| `RxInfer = "=X.Y.Z"` and every other direct dep | `Project.toml` + committed `Manifest.toml` | The equality pins *are* the reproducibility story. Changing them is a reviewable PR, never a side effect of a weekly build. |
+| `RxInfer = "=X.Y.Z"` and every other direct dep | `Project.toml` + committed `Manifest.toml` | The equality pins *are* the reproducibility story. Changing them is a reviewable PR. |
 | `actions/checkout`, `julia-actions/install-juliaup`, the release action | `.github/workflows/release.yml` | SHA-pinned with a trailing `# vX.Y.Z` comment, following the upstream action's own examples. |
 | `juliaup link` | `install.sh`, `install.ps1` | The one genuinely documented, stable interface in the delivery path. |
 
@@ -72,7 +72,8 @@ unversioned upstream work, and the failure modes differ by pin.
 | Build fine, but a student hits `SystemError`/missing file at **run** time | A package reads a file at run time that the default copy globs do not ship. Add a pattern to `additional-copy-globs`. This class of failure never shows up at build time — only the smoke test catches it. |
 | `pack` fails on Windows | A symlink appeared in the tree. The action rejects those deliberately (extraction needs a privilege most end users lack). Ship a `.zip` for Windows instead. |
 | Signing fails | `rcodesign` checksum mismatch, or the job is not on an Apple Silicon runner. |
-| The workload errors | A model in `precompile.jl` broke against a new RxInfer. This is exactly the early warning the weekly build exists to provide — fix the workload, or the RxInfer regression. |
+| `The runner has received a shutdown signal` / `signal 15` mid-build | The runner VM died, not Julia. Peak memory during the system image link is the usual suspect (`JULIA_IMAGE_THREADS: "1"` already mitigates); infrastructure preemption looks the same. Rerun the failed platform alone — `gh run rerun --failed` — before assuming anything. |
+| The workload errors | A model in `precompile.jl` broke against a new RxInfer. Fix the workload, or the RxInfer regression it exposed. |
 | macOS: "cannot be opened because the developer cannot be verified" | The tarball was downloaded in a browser and carries `com.apple.quarantine`. Ad-hoc signing does not satisfy Gatekeeper. `xattr -dr com.apple.quarantine <dir>`, or install via the script (`curl` never sets the attribute). |
 
 ## Deliberate, not bugs
@@ -104,19 +105,30 @@ unversioned upstream work, and the failure modes differ by pin.
 
 ## Release cadence
 
-Two tracks over one workflow:
+**A `v*` tag is the only thing that builds.** There is no schedule. A full matrix costs roughly $7
+in billed runner minutes — macOS is a 10x multiplier and takes ~100 minutes on a hosted runner,
+Windows is 2x at ~60 — so a weekly refresh would have been ~$360/year to find out that a dependency
+moved. (Note for anyone recalculating this: public repositories do **not** get these minutes free
+in this organization; the first release build was billed.)
 
-- **stable** — `v*` tag or `workflow_dispatch`; marked latest; what the installer installs by
-  default. This is what students get.
-- **weekly** — Sunday `schedule`; published as a `weekly-YYYY-MM-DD` **prerelease** with
-  `make_latest: false`. It re-resolves rather than building the committed manifest (the point is to
-  catch new RxInfer/dependency versions early), skips the build when the resolved `project_hash`
-  matches the previous weekly's, and keeps only the last four.
+`workflow_dispatch` runs the same matrix and publishes nothing, which is how you verify a change to
+the build without spending a tag on it. Cutting a release therefore means: bump the pins in a PR,
+dispatch a build if the change was risky, then tag.
 
-A Sunday build must never become what `julia +rxinfer` resolves to for a student mid-course.
-Promotion to stable is deliberate: commit the weekly's manifest with updated equality pins via PR,
-then tag. **During teaching weeks, freeze** — cut a stable release before the course starts and let
-the weeklies serve as an early-warning system.
+Because there is no scheduled early-warning build, **nothing here notices on its own that a new
+RxInfer or Julia has broken the build.** You find out when you next tag. If that becomes a problem,
+the cheap fix is a Linux-only scheduled build (1x multiplier) rather than restoring the full matrix.
+
+### Costs and failure notes from the first release
+
+- macOS ~100 min, Windows ~60 min, Linux ~12 min to the point of failure. `fail-fast: false` is
+  what lets a retry rebuild only the platform that died instead of paying for the matrix again;
+  `gh run rerun --failed` reuses the successful platforms' artifacts.
+- The Linux runner was killed with `The runner has received a shutdown signal` and `signal 15`
+  five minutes into `compiling incremental system image` — the peak-memory moment. Not a Julia
+  error, not the timeout. Most likely memory pressure, though nothing in the log says so outright
+  and infrastructure preemption looks identical. `JULIA_IMAGE_THREADS: "1"` is set workflow-wide as
+  the mitigation; if it recurs, add a swapfile step or move to a larger runner.
 
 ## Working on this repo
 

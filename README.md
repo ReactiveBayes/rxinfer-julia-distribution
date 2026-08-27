@@ -60,7 +60,6 @@ about it.
 | | |
 | --- | --- |
 | `--version <tag>` | install a specific release instead of the latest |
-| `--weekly` | install the newest weekly build (for testing — not for coursework) |
 | `--no-telemetry` | also set `LOG_USING_RXINFER=false` in your shell profile |
 | `--channel <name>` | use a different juliaup channel name |
 
@@ -70,7 +69,7 @@ When piping into `bash`, pass options after `-s --`:
 curl -fsSL .../install.sh | bash -s -- --no-telemetry
 ```
 
-On Windows use PowerShell parameter syntax (`-NoTelemetry`, `-Version v1.2.3`, `-Weekly`).
+On Windows use PowerShell parameter syntax (`-NoTelemetry`, `-Version v1.2.3`).
 
 ## Using it
 
@@ -242,5 +241,7 @@ env DISTRIBUTION_ID=rxinfer-local-$(uname -m) SOURCE_PATH="$PWD" \
 ./distributions/rxinfer-local-$(uname -m)/bin/julia scripts/smoke_test.jl
 ```
 
-Releases are cut by tagging `v*`; a weekly prerelease builds every Sunday. Both go through
-`.github/workflows/release.yml`.
+Releases are cut by tagging `v*`, which is the **only** thing that triggers a build — there is no
+schedule, because a full matrix costs roughly $7 in billed runner minutes (macOS is a 10x
+multiplier at ~100 minutes, Windows 2x at ~60). `workflow_dispatch` builds the same matrix without
+publishing, for verifying a change before spending a tag on it.

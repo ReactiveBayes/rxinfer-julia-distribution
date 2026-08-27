@@ -13,9 +13,6 @@
 .PARAMETER Version
     Install a specific release tag instead of the latest stable release.
 
-.PARAMETER Weekly
-    Install the newest weekly prerelease. For testing, not for a course.
-
 .PARAMETER NoTelemetry
     Also set LOG_USING_RXINFER=false as a persistent user environment variable.
 
@@ -32,7 +29,6 @@
 [CmdletBinding()]
 param(
     [string]$Version = $env:RXINFER_DIST_VERSION,
-    [switch]$Weekly,
     [switch]$NoTelemetry,
     [string]$Channel = "rxinfer"
 )
@@ -99,20 +95,11 @@ Write-Step "Using juliaup: $((Get-Command juliaup).Source)"
 $api = "https://api.github.com/repos/$Repository/releases"
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
-    if ($Weekly) {
-        # Weekly builds are prereleases, so /latest never returns one.
-        $releases = Invoke-RestMethod -Uri "$api`?per_page=30" -UseBasicParsing
-        $weeklyRelease = $releases | Where-Object { $_.tag_name -like "weekly-*" } | Select-Object -First 1
-        if (-not $weeklyRelease) { throw "No weekly prerelease found in $Repository." }
-        $Version = $weeklyRelease.tag_name
+    try {
+        $Version = (Invoke-RestMethod -Uri "$api/latest" -UseBasicParsing).tag_name
     }
-    else {
-        try {
-            $Version = (Invoke-RestMethod -Uri "$api/latest" -UseBasicParsing).tag_name
-        }
-        catch {
-            throw "No stable release found in $Repository. Pass -Weekly to install a weekly build."
-        }
+    catch {
+        throw "No release found in $Repository. See https://github.com/$Repository/releases"
     }
 }
 Write-Step "Release: $Version"

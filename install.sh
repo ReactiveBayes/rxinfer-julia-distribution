@@ -6,9 +6,8 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/ReactiveBayes/rxinfer-julia-distribution/main/install.sh | bash
 #
-# Options (pass after `-s --` when piping: `... | bash -s -- --weekly`):
-#   --version <tag>   install a specific release tag instead of the latest stable
-#   --weekly          install the newest weekly prerelease (for testing, not for a course)
+# Options (pass after `-s --` when piping: `... | bash -s -- --no-telemetry`):
+#   --version <tag>   install a specific release tag instead of the latest
 #   --no-telemetry    also add LOG_USING_RXINFER=false to your shell profile
 #   --channel <name>  juliaup channel name to create (default: rxinfer)
 #   -h, --help        show this and exit
@@ -21,7 +20,6 @@ set -euo pipefail
 REPOSITORY="${RXINFER_DIST_REPOSITORY:-ReactiveBayes/rxinfer-julia-distribution}"
 VERSION="${RXINFER_DIST_VERSION:-}"
 CHANNEL="rxinfer"
-WEEKLY="false"
 NO_TELEMETRY="false"
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -31,7 +29,6 @@ die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 while [ "$#" -gt 0 ]; do
   case "${1}" in
     --version) VERSION="${2:?--version needs a tag}"; shift 2 ;;
-    --weekly) WEEKLY="true"; shift ;;
     --no-telemetry) NO_TELEMETRY="true"; shift ;;
     --channel) CHANNEL="${2:?--channel needs a name}"; shift 2 ;;
     -h | --help)
@@ -40,8 +37,7 @@ while [ "$#" -gt 0 ]; do
       cat <<'USAGE'
 Installs the RxInfer Julia distribution as the juliaup channel `rxinfer`.
 
-  --version <tag>   install a specific release tag instead of the latest stable
-  --weekly          install the newest weekly prerelease (testing, not coursework)
+  --version <tag>   install a specific release tag instead of the latest
   --no-telemetry    also add LOG_USING_RXINFER=false to your shell profile
   --channel <name>  juliaup channel name to create (default: rxinfer)
   -h, --help        show this and exit
@@ -105,19 +101,11 @@ log "Using juliaup: $(command -v juliaup)"
 API="https://api.github.com/repos/${REPOSITORY}/releases"
 
 if [ -z "${VERSION}" ]; then
-  if [ "${WEEKLY}" = "true" ]; then
-    # Weekly builds are prereleases, so /latest never returns one.
-    VERSION="$(curl -fsSL "${API}?per_page=30" |
-      grep -o '"tag_name": *"weekly-[^"]*"' | head -n 1 |
-      sed 's/.*"weekly-/weekly-/; s/"$//')"
-    [ -n "${VERSION}" ] || die "no weekly prerelease found in ${REPOSITORY}."
-  else
-    VERSION="$(curl -fsSL "${API}/latest" |
-      grep -o '"tag_name": *"[^"]*"' | head -n 1 |
-      sed 's/.*: *"//; s/"$//')"
-    [ -n "${VERSION}" ] ||
-      die "no stable release found in ${REPOSITORY}. Pass --weekly to install a weekly build."
-  fi
+  VERSION="$(curl -fsSL "${API}/latest" |
+    grep -o '"tag_name": *"[^"]*"' | head -n 1 |
+    sed 's/.*: *"//; s/"$//')"
+  [ -n "${VERSION}" ] ||
+    die "no release found in ${REPOSITORY}. See https://github.com/${REPOSITORY}/releases"
 fi
 log "Release: ${VERSION}"
 
