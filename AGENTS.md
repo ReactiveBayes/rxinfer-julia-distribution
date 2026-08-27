@@ -124,11 +124,32 @@ the cheap fix is a Linux-only scheduled build (1x multiplier) rather than restor
 - macOS ~100 min, Windows ~60 min, Linux ~12 min to the point of failure. `fail-fast: false` is
   what lets a retry rebuild only the platform that died instead of paying for the matrix again;
   `gh run rerun --failed` reuses the successful platforms' artifacts.
-- The Linux runner was killed with `The runner has received a shutdown signal` and `signal 15`
-  five minutes into `compiling incremental system image` — the peak-memory moment. Not a Julia
-  error, not the timeout. Most likely memory pressure, though nothing in the log says so outright
-  and infrastructure preemption looks identical. `JULIA_IMAGE_THREADS: "1"` is set workflow-wide as
-  the mitigation; if it recurs, add a swapfile step or move to a larger runner.
+- **The Linux OOM, and why x86_64 is the hard case.** The Linux runner was killed during
+  `compiling incremental system image` on both the v0.0.1 and v0.0.2 attempts, with
+  `The runner has received a shutdown signal` and `signal 15` — no Julia error, nowhere near the
+  timeout. Reproduced locally in a memory-capped Debian container (`--memory=7g`), where it is
+  unambiguous: PackageCompiler's own monitor warns `Free system memory dropped to 174 MiB during
+  sysimage compilation`, the `--output-o` child dies with `ProcessSignaled(9)`, and cgroup v2
+  reports `oom_kill 1`.
+
+  The asymmetry worth understanding: `macos-latest` has **7 GB** and succeeds while `ubuntu-latest`
+  has **16 GB** and fails. That is not runner strength, it is `cpu_target`.
+  `PackageCompiler.default_app_cpu_target()` returns
+  `generic;sandybridge,-xsaveopt,clone_all;haswell,-rdrnd,base(1)` on x86_64 — **`clone_all` clones
+  every function for a second microarchitecture** — against
+  `generic;cortex-a57;thunderx2t99;armv8.2-a,...` (no `clone_all`) on aarch64. The x86_64 link is
+  simply a much bigger one.
+
+  Mitigations, in the order they were tried:
+  1. `JULIA_IMAGE_THREADS: "1"` (workflow-wide). Helped — survival in the link went from 5.3 to
+     23.1 minutes — but did not fix it.
+  2. A 24 GB swapfile on `/mnt` before the Linux build. Swap does not reduce what the link needs;
+     it stops the kernel from killing it, at the cost of a slower link.
+  3. Not yet done, and the only fix that addresses the cause: pass a cheaper `cpu_target`
+     (`generic`, or the same list minus `clone_all`). **The action exposes no way to do this** —
+     there is no option passthrough — so it means either an upstream input or calling
+     `create_distribution` ourselves instead of via the action. It would also shrink the 832 MB
+     system image and the 409 MB download.
 
 ## Working on this repo
 

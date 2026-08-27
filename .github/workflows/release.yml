@@ -121,6 +121,32 @@ jobs:
         with:
           channel: "${{ env.JULIA_VERSION }}"
 
+      # The system image link is the peak-memory moment of the build, and on
+      # x86_64 it is far heavier than on aarch64: PackageCompiler's default
+      # cpu_target for x86_64 is
+      # `generic;sandybridge,-xsaveopt,clone_all;haswell,-rdrnd,base(1)`, and
+      # `clone_all` clones every function for a second microarchitecture. That is
+      # why a 16 GB Linux runner OOM-killed the linker (SIGKILL on the
+      # `--output-o` child) while a 7 GB macOS runner succeeded.
+      #
+      # Swap does not make the link need less memory; it stops the kernel from
+      # killing it. `/mnt` is the runner's large scratch disk. The action gives
+      # no way to pass `cpu_target`, which would be the real fix.
+      - name: "Add swap for the system image link"
+        if: "matrix.platform == 'linux-x86_64'"
+        run: |
+          set -euo pipefail
+          echo "before:"
+          free -h
+          df -h /mnt | tail -1
+          sudo fallocate -l 24G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile >/dev/null
+          sudo swapon /mnt/swapfile
+          echo "after:"
+          swapon --show
+          free -h
+
       - name: "Build the distribution"
         id: "build-distribution"
         uses: "JuliaComputing/create-julia-distribution@958799562b82fcabd2f5508f7ee296e1d91de200"
